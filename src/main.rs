@@ -35,6 +35,7 @@ use std::sync::Mutex;
 use std::sync::mpsc::channel;
 use std::thread;
 
+use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Error;
 use anyhow::ensure;
@@ -209,6 +210,13 @@ as arguments (old content, new content). Examples:
 
     #[arg(index = 2, help = "Substitution to replace with.")]
     subst: String,
+
+    #[arg(
+        short = 'S',
+        long = "subst-escapes",
+        help = "Treat some characters in substitution string escaped with a leading \\ as special:\n  '\\t' -> horizontal tab (TAB)\n  '\\n' -> new line or line feed (LF)\n  '\\r' -> carriage return (CR)\n  '\\ ' -> blank space\n  '\\\"' -> double quote\n  '\\$' -> dollar sign\n  \"\\'\" -> single quote\n  '\\\\' -> backslash\n  '\\`' -> grave accent or backtick"
+    )]
+    subst_escapes: bool,
 }
 
 fn notify_fast_mode() {
@@ -324,7 +332,7 @@ fn index_to_row_col(s: &str, index: usize) -> (usize, usize) {
     (line_num, col as usize)
 }
 
-fn display_warning(error: &Error) -> DisplayWarning {
+fn display_warning(error: &Error) -> DisplayWarning<'_> {
     DisplayWarning { inner: error }
 }
 
@@ -913,6 +921,45 @@ impl Fastmod {
     }
 }
 
+fn unescape(string: &str) -> Result<String> {
+    let mut result = String::with_capacity(string.len());
+    let mut characters = string.chars().enumerate();
+    while let Some((_, chr)) = characters.next() {
+        match chr {
+            '\\' => match characters.next() {
+                None => {
+                    return Err(anyhow!("No character following the backslash"));
+                }
+                Some((index, nextchr)) => {
+                    result.push(match nextchr {
+                        't' => '\t',  // 0x09
+                        'n' => '\n',  // 0x0a
+                        'r' => '\r',  // 0x0d
+                        ' ' => ' ',   // 0x20
+                        '"' => '"',   // 0x22
+                        '$' => '$',   // 0x24
+                        '\'' => '\'', // 0x27
+                        '\\' => '\\', // 0x5c
+                        '`' => '`',   // 0x60
+                        _ => {
+                            return Err(anyhow!(
+                                "Invalid escape sequence {}{} at index {} in '{}'",
+                                chr,
+                                nextchr,
+                                index,
+                                string
+                            ))
+                        }
+                    });
+                    continue;
+                }
+            },
+            _ => result.push(chr),
+        }
+    }
+    Ok(result)
+}
+
 fn fastmod() -> Result<()> {
     let Args {
         multiline,
@@ -930,6 +977,7 @@ fn fastmod() -> Result<()> {
         diff_tool,
         match_regex,
         subst,
+        subst_escapes,
     } = Args::parse();
     let dirs = {
         let mut dirs: Vec<_> = dir
@@ -984,6 +1032,11 @@ not what you want. Press Enter to continue anyway or Ctrl-C to quit.",
         .multi_line(true)
         .dot_matches_new_line(multiline)
         .build(&maybe_escaped_regex)?;
+    let subst = if subst_escapes {
+        unescape(&subst)?
+    } else {
+        subst
+    };
 
     if accept_all {
         Fastmod::run_fast(
@@ -1046,6 +1099,152 @@ mod tests {
     }
 
     #[test]
+    fn test_simple_replace_all() {
+        let dir = create_test_files(&[("file1.c", "foo\nfoo blah foo")]);
+        Command::cargo_bin("fastmod")
+            .unwrap()
+            .args(&[
+                "foo",
+                "bar",
+                "--accept-all",
+                "--dir",
+                dir.path().to_str().unwrap(),
+            ])
+            .assert()
+            .success();
+        let contents = read_to_string(dir.path().join("file1.c")).unwrap();
+        assert_eq!(contents, "bar\nbar blah bar");
+    }
+
+    #[test]
+    fn test_simple_multiline_replace_all() {
+        let dir = create_test_files(&[
+            (
+                "file1.c",
+                "#ifndef SOME_HDR_GUARD\n#define SOME_HDR_GUARD\n\n\n#endif\n",
+            ),
+            (
+                "file2.c",
+                "#ifndef SOME_HDR_GUARD\r\n#define SOME_HDR_GUARD\r\n\r\n\r\n#endif\r\n",
+            ),
+        ]);
+        Command::cargo_bin("fastmod")
+            .unwrap()
+            .args(&[
+                "^(#\\s*??ifndef\\s+?)(\\w+?)((?:\\r?\\n)+)",
+                "#if 0${3}",
+                "--multiline",
+                "--accept-all",
+                "--dir",
+                dir.path().to_str().unwrap(),
+            ])
+            .assert()
+            .success();
+        let file1_contents = read_to_string(dir.path().join("file1.c")).unwrap();
+        assert_eq!(
+            file1_contents,
+            "#if 0\n#define SOME_HDR_GUARD\n\n\n#endif\n"
+        );
+
+        let file1_contents = read_to_string(dir.path().join("file2.c")).unwrap();
+        assert_eq!(
+            file1_contents,
+            "#if 0\r\n#define SOME_HDR_GUARD\r\n\r\n\r\n#endif\r\n"
+        );
+    }
+
+    #[test]
+    fn test_simple_replace_all_with_subst_escapes() {
+        let dir = create_test_files(&[
+            (
+                "file1.c",
+                "#ifndef SOME_HDR_GUARD\n#define SOME_HDR_GUARD\n\n\n#endif\n",
+            ),
+            (
+                "file2.c",
+                "#ifndef SOME_HDR_GUARD\r\n#define SOME_HDR_GUARD\r\n\r\n\r\n#endif\r\n",
+            ),
+        ]);
+        Command::cargo_bin("fastmod")
+            .unwrap()
+            .args(&[
+                "^#\\s*??ifndef\\s+?\\w+?(?:\\r?\\n)+",
+                "#if 0\\t // \\$ \\\\ \\\" \\' \\r\\n",
+                "--accept-all",
+                "--multiline",
+                "--subst-escapes",
+                "--dir",
+                dir.path().to_str().unwrap(),
+            ])
+            .assert()
+            .success();
+        let file1_contents = read_to_string(dir.path().join("file1.c")).unwrap();
+        assert_eq!(
+            file1_contents,
+            "#if 0\t // $ \\ \" ' \r\n#define SOME_HDR_GUARD\n\n\n#endif\n"
+        );
+
+        let file1_contents = read_to_string(dir.path().join("file2.c")).unwrap();
+        assert_eq!(
+            file1_contents,
+            "#if 0\t // $ \\ \" ' \r\n#define SOME_HDR_GUARD\r\n\r\n\r\n#endif\r\n"
+        );
+    }
+
+    #[test]
+    fn test_glob_matches() {
+        let dir = create_test_files(&[
+            ("f1.txt", "some awesome text"),
+            ("f2.TXT", "some more awesome text"),
+            ("skip.rs", "i should be skipped but i am still awesome"),
+        ]);
+
+        Command::cargo_bin("fastmod")
+            .unwrap()
+            .args(&[
+                "awesome",
+                "great",
+                "--accept-all",
+                "--iglob",
+                "*.txt",
+                "--dir",
+                dir.path().to_str().unwrap(),
+            ])
+            .assert()
+            .success();
+
+        let lower_translated = read_to_string(dir.path().join("f1.txt")).unwrap();
+        let upper_translated = read_to_string(dir.path().join("f2.TXT")).unwrap();
+        let skipped_translated = read_to_string(dir.path().join("skip.rs")).unwrap();
+        assert_eq!(lower_translated, "some great text");
+        assert_eq!(upper_translated, "some more great text");
+        assert_eq!(
+            skipped_translated,
+            "i should be skipped but i am still awesome"
+        );
+    }
+
+    #[test]
+    fn test_fixed_strings() {
+        let dir = create_test_files(&[("file1.txt", "foo+bar\nfoooobar")]);
+        let file_path = dir.path().join("file1.txt");
+        Command::cargo_bin("fastmod")
+            .unwrap()
+            .args(&[
+                "foo+bar",
+                "baz",
+                "--accept-all",
+                "--dir",
+                dir.path().to_str().unwrap(),
+                "--fixed-strings",
+            ])
+            .assert()
+            .success();
+        let contents = read_to_string(file_path).unwrap();
+        assert_eq!(contents, "baz\nfoooobar");
+    }
+
+    #[test]
     fn test_diff_with_unchanged_line_in_middle() {
         let fm = Fastmod::new(false, false, false, false, None);
         let diffs = fm.diffs_to_print("foo\nbar\nbaz", "bat\nbar\nqux");
@@ -1102,5 +1301,77 @@ mod tests {
             .unwrap();
         let contents = read_to_string(file_path).unwrap();
         assert_eq!(contents, "foofoo");
+    }
+
+    #[test]
+    fn test_empty_contents() {
+        let dir = create_test_files(&[("foo.txt", "foo")]);
+        Command::cargo_bin("fastmod")
+            .unwrap()
+            .args(&["foo", "baz", "--dir", dir.path().to_str().unwrap()])
+            .write_stdin("n\n")
+            .assert()
+            .success();
+    }
+
+    // Leading dot meaning hidden is a Unix thing.
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn test_hidden_files() {
+        for &hidden in &[false, true] {
+            let dir = create_test_files(&[(".hidden", "foo")]);
+            let mut args = vec![
+                "foo",
+                "bar",
+                "--dir",
+                dir.path().to_str().unwrap(),
+                "--accept-all",
+            ];
+            if hidden {
+                args.push("--hidden");
+            }
+
+            Command::cargo_bin("fastmod")
+                .unwrap()
+                .args(&args)
+                .assert()
+                .success();
+            let file_path = dir.path().join(".hidden");
+            let contents = read_to_string(file_path).unwrap();
+            if hidden {
+                assert_eq!(contents, "bar");
+            } else {
+                assert_eq!(contents, "foo");
+            }
+        }
+    }
+
+    #[test]
+    fn test_replace_next_to_unicode_character() {
+        let contents = "I have “unicodequotes”";
+        let dir = create_test_files(&[("foo.txt", contents)]);
+        Command::cargo_bin("fastmod")
+            .unwrap()
+            .args(&[
+                "quotes",
+                "characters",
+                "--dir",
+                dir.path().to_str().unwrap(),
+            ])
+            .write_stdin("n\n")
+            .assert()
+            .success();
+    }
+
+    #[test]
+    fn test_unescape_valid_escape_sequences() {
+        let unescaped = unescape("\\t\\n\\r\\ \\\"\\$\\'\\\\\\`").unwrap();
+        assert_eq!(unescaped, "\t\n\r \"$'\\`");
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_unescape_invalid_escape_sequences() {
+        unescape("\\a\\b\\c\\d\\e\\f\\,\\:").unwrap();
     }
 }
